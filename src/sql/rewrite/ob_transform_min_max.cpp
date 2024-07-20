@@ -138,55 +138,27 @@ int ObTransformMinMax::do_minmax_transform(ObSelectStmt *select_stmt)
 
   /*
    * Ok, just a test
-   * First, for each aggregation, we create a copy of the original stmt,
-   * reset having clause, and apply the original logic to generate new subquery.
+   * First, for each aggregation, we create a copy of the view stmt,
    * Then, replace agg in the original stmt with all subqueries using replace_relation_exprs
-   * TODO: modify check function
-   *
-   * Not tested, even not built yet, LOL
-   * Feel free to modify or delete these code
    */
   ObArray<ObRawExpr *> aggr_items;
   for (int i = 0; i < select_stmt->get_aggr_item_size(); ++i) {
     aggr_items.push_back(select_stmt->get_aggr_item(i));
   }
 
-  ObArray<OrderItem> order_items;
-  append(order_items, select_stmt->get_order_items());
-  select_stmt->get_order_items().reset();
+  ObSelectStmt *view_child_stmt = NULL;
+  if (OB_FAIL(ObTransformUtils::create_simple_view(ctx_, select_stmt, view_child_stmt))) {
+    LOG_WARN("failed to create simple view", K(ret));
+  }
 
   for (int i = 0; i < aggr_items.count(); ++i) {
-    ObSelectStmt *tmp_select_stmt = NULL;
-    ctx_->stmt_factory_->create_stmt(tmp_select_stmt);
-    tmp_select_stmt->deep_copy(*ctx_->stmt_factory_,
-                               *ctx_->expr_factory_,
-                               *select_stmt);
-      
-    ObArray<ObRawExpr *> tmp_aggr_items;
-    append(tmp_aggr_items, tmp_select_stmt->get_aggr_items());
-    tmp_select_stmt->get_aggr_items().reset();
-
-    // TODO: How to construct SelectItem?
-    // Seems like only alias_name_ and expr_name_ are set
-    SelectItem item;
-    item.expr_ = tmp_aggr_items.at(i);
-
-    tmp_select_stmt->get_select_items().reset();
-    tmp_select_stmt->get_select_items().push_back(item);
-    tmp_select_stmt->get_having_exprs().reset();
-    tmp_select_stmt->get_aggr_items().push_back(static_cast<ObAggFunRawExpr *>(tmp_aggr_items.at(i)));
-
     ObQueryRefRawExpr *query_ref_expr = NULL;
-    if (OB_FAIL(transform_single_agg(tmp_select_stmt, query_ref_expr))) {
+    if (OB_FAIL(transform_single_agg(i, select_stmt, view_child_stmt, query_ref_expr))) {
       LOG_WARN("failed to generate subquery", K(ret));
       return ret;
     }
     query_ref_exprs.push_back(query_ref_expr);
   }
-
-  append(select_stmt->get_order_items(), order_items);
-  order_items.reset();
-  select_stmt->get_condition_exprs().reset();
 
   // adjust select_stmt
   if (OB_FAIL(select_stmt->get_condition_exprs().assign(select_stmt->get_having_exprs()))) {
@@ -199,7 +171,6 @@ int ObTransformMinMax::do_minmax_transform(ObSelectStmt *select_stmt)
     select_stmt->get_aggr_items().reset();
     select_stmt->get_having_exprs().reset();
     select_stmt->get_column_items().reset();
-    select_stmt->get_semi_infos().reset();
     if (OB_FAIL(select_stmt->adjust_subquery_list())) {
       LOG_WARN("failed to adjust subquery list", K(ret));
     } else if (OB_FAIL(select_stmt->formalize_stmt(ctx_->session_info_))) {
@@ -212,10 +183,12 @@ int ObTransformMinMax::do_minmax_transform(ObSelectStmt *select_stmt)
   return ret;
 }
 
-int ObTransformMinMax::transform_single_agg(ObSelectStmt *select_stmt, ObQueryRefRawExpr *&query_ref_expr)
+int ObTransformMinMax::transform_single_agg(int i,
+                                            ObSelectStmt *select_stmt,
+                                            ObSelectStmt *view_child_stmt,
+                                            ObQueryRefRawExpr *&query_ref_expr)
 {
   int ret = OB_SUCCESS;
-  ObSelectStmt *view_child_stmt = NULL;
   ObSelectStmt *child_stmt = NULL;
   ObAggFunRawExpr *aggr_expr = NULL;
   ObRawExpr *aggr_param = NULL;
@@ -229,15 +202,13 @@ int ObTransformMinMax::transform_single_agg(ObSelectStmt *select_stmt, ObQueryRe
     LOG_WARN("params have null", K(ret), K(select_stmt), K(ctx_));
   } else {
     ObRawExprCopier copier(*ctx_->expr_factory_);
-    if (OB_FAIL(ObTransformUtils::create_simple_view(ctx_, select_stmt, view_child_stmt))) {
-      LOG_WARN("failed to create simple view", K(ret));
-    } else if (OB_FAIL(select_stmt->get_column_exprs(old_exprs))) {
+    if (OB_FAIL(select_stmt->get_column_exprs(old_exprs))) {
       LOG_WARN("failed to get column exprs", K(ret));
     } else if (OB_FAIL(view_child_stmt->get_select_exprs(new_exprs))) {
       LOG_WARN("failed to get select exprs", K(ret));
     } else if (OB_FAIL(copier.add_replaced_expr(old_exprs, new_exprs))) {
       LOG_WARN("failed to add replace pair", K(ret));
-    } else if (OB_ISNULL(aggr_expr = select_stmt->get_aggr_item(0))
+    } else if (OB_ISNULL(aggr_expr = select_stmt->get_aggr_item(i))
           || OB_ISNULL(aggr_param = aggr_expr->get_param_expr(0))) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("get unexpected null", K(ret));
@@ -465,7 +436,6 @@ int ObTransformMinMax::is_valid_having_expr(const ObRawExpr *expr, bool &is_vali
 int ObTransformMinMax::is_valid_order_list(const ObSelectStmt &stmt, bool &is_valid)
 {
   int ret = OB_SUCCESS;
-  return ret;
   bool valid = true;
   for (int64_t i = 0; OB_SUCC(ret) && valid && i < stmt.get_order_item_size(); ++i) {
     if (OB_FAIL(is_valid_order_expr(stmt.get_order_item(i).expr_, valid))) {

@@ -72,7 +72,10 @@ private:
 
   int do_minmax_transform(ObSelectStmt *select_stmt);
 
-  int transform_single_agg(ObSelectStmt *select_stmt, ObQueryRefRawExpr *&query_ref_expr);
+  int transform_single_agg(int i,
+                           ObSelectStmt *select_stmt,
+                           ObSelectStmt *view_child_stmt,
+                           ObQueryRefRawExpr *&query_ref_expr);
 
   int deep_copy_subquery_for_aggr(const ObSelectStmt &copied_stmt,
                                   ObRawExpr *aggr_param,
