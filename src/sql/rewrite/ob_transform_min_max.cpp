@@ -10,6 +10,8 @@
  * See the Mulan PubL v2 for more details.
  */
 
+#include "lib/container/ob_array.h"
+#include "lib/geo/ob_sdo_geo_object.h"
 #define USING_LOG_PREFIX SQL_REWRITE
 #include "ob_transform_min_max.h"
 #include "ob_transformer_impl.h"
@@ -88,8 +90,7 @@ int ObTransformMinMax::check_transform_validity(ObTransformerCtx &ctx,
     OPT_TRACE("stmt has recusive cte or hierarchical query");
   } else if (select_stmt->get_from_item_size() != 1 || select_stmt->get_from_item(0).is_joined_
              || select_stmt->get_aggr_item_size() < 1 || !select_stmt->is_scala_group_by()
-             || select_stmt->is_contains_assignment()
-             || select_stmt->get_aggr_item_size() > 1) {
+             || select_stmt->is_contains_assignment()) {
     OPT_TRACE("not a simple aggr query");
   } else if (OB_FAIL(select_stmt->has_rownum(has_rownum))) {
     LOG_WARN("failed to check if select stmt has rownum", K(ret));
@@ -132,6 +133,88 @@ int ObTransformMinMax::do_transform(ObSelectStmt *select_stmt)
 int ObTransformMinMax::do_minmax_transform(ObSelectStmt *select_stmt)
 {
   int ret = OB_SUCCESS;
+  ObRawExpr *aggr_param = NULL;
+  ObArray<ObRawExpr *> query_ref_exprs;
+
+  /*
+   * Ok, just a test
+   * First, for each aggregation, we create a copy of the original stmt,
+   * reset having clause, and apply the original logic to generate new subquery.
+   * Then, replace agg in the original stmt with all subqueries using replace_relation_exprs
+   * TODO: modify check function
+   *
+   * Not tested, even not built yet, LOL
+   * Feel free to modify or delete these code
+   */
+  ObArray<ObRawExpr *> aggr_items;
+  for (int i = 0; i < select_stmt->get_aggr_item_size(); ++i) {
+    aggr_items.push_back(select_stmt->get_aggr_item(i));
+  }
+
+  ObArray<OrderItem> order_items;
+  append(order_items, select_stmt->get_order_items());
+  select_stmt->get_order_items().reset();
+
+  for (int i = 0; i < aggr_items.count(); ++i) {
+    ObSelectStmt *tmp_select_stmt = NULL;
+    ctx_->stmt_factory_->create_stmt(tmp_select_stmt);
+    tmp_select_stmt->deep_copy(*ctx_->stmt_factory_,
+                               *ctx_->expr_factory_,
+                               *select_stmt);
+      
+    ObArray<ObRawExpr *> tmp_aggr_items;
+    append(tmp_aggr_items, tmp_select_stmt->get_aggr_items());
+    tmp_select_stmt->get_aggr_items().reset();
+
+    // TODO: How to construct SelectItem?
+    // Seems like only alias_name_ and expr_name_ are set
+    SelectItem item;
+    item.expr_ = tmp_aggr_items.at(i);
+
+    tmp_select_stmt->get_select_items().reset();
+    tmp_select_stmt->get_select_items().push_back(item);
+    tmp_select_stmt->get_having_exprs().reset();
+    tmp_select_stmt->get_aggr_items().push_back(static_cast<ObAggFunRawExpr *>(tmp_aggr_items.at(i)));
+
+    ObQueryRefRawExpr *query_ref_expr = NULL;
+    if (OB_FAIL(transform_single_agg(tmp_select_stmt, query_ref_expr))) {
+      LOG_WARN("failed to generate subquery", K(ret));
+      return ret;
+    }
+    query_ref_exprs.push_back(query_ref_expr);
+  }
+
+  append(select_stmt->get_order_items(), order_items);
+  order_items.reset();
+  select_stmt->get_condition_exprs().reset();
+
+  // adjust select_stmt
+  if (OB_FAIL(select_stmt->get_condition_exprs().assign(select_stmt->get_having_exprs()))) {
+    LOG_WARN("failed to replace aggr exprs to query ref exprs", K(ret));
+  } else if (OB_FAIL(select_stmt->replace_relation_exprs(aggr_items, query_ref_exprs))) {
+    LOG_WARN("failed to assign condition exprs", K(ret));
+  } else {
+    select_stmt->get_from_items().reset();
+    select_stmt->get_table_items().reset();
+    select_stmt->get_aggr_items().reset();
+    select_stmt->get_having_exprs().reset();
+    select_stmt->get_column_items().reset();
+    select_stmt->get_semi_infos().reset();
+    if (OB_FAIL(select_stmt->adjust_subquery_list())) {
+      LOG_WARN("failed to adjust subquery list", K(ret));
+    } else if (OB_FAIL(select_stmt->formalize_stmt(ctx_->session_info_))) {
+      LOG_WARN("failed to formalize stmt", K(ret));
+    } else {
+      LOG_TRACE("succeed to do transform min max", KPC(select_stmt));
+    }
+  }
+
+  return ret;
+}
+
+int ObTransformMinMax::transform_single_agg(ObSelectStmt *select_stmt, ObQueryRefRawExpr *&query_ref_expr)
+{
+  int ret = OB_SUCCESS;
   ObSelectStmt *view_child_stmt = NULL;
   ObSelectStmt *child_stmt = NULL;
   ObAggFunRawExpr *aggr_expr = NULL;
@@ -140,8 +223,6 @@ int ObTransformMinMax::do_minmax_transform(ObSelectStmt *select_stmt)
   ObSEArray<ObRawExpr*, 1> old_exprs;
   ObSEArray<ObRawExpr*, 1> new_exprs;
   ObArray<ObRawExpr *> aggr_items;
-  ObArray<ObRawExpr *> query_ref_exprs;
-  ObQueryRefRawExpr *query_ref_expr = NULL;
   ObRawExpr *target_expr = NULL;
   if (OB_ISNULL(select_stmt) || OB_ISNULL(ctx_) || OB_ISNULL(ctx_->expr_factory_)) {
     ret = OB_INVALID_ARGUMENT;
@@ -183,31 +264,10 @@ int ObTransformMinMax::do_minmax_transform(ObSelectStmt *select_stmt)
         LOG_WARN("add column type to subquery ref expr failed", K(ret));
       } else if (OB_FAIL(query_ref_expr->formalize(ctx_->session_info_))) {
         LOG_WARN("failed to formalize coalesce query expr", K(ret));
-      } else if (OB_FAIL(query_ref_exprs.push_back(query_ref_expr))) {
-        LOG_WARN("failed to push back query ref expr", K(ret));
-      }
-    }
-    // adjust select_stmt
-    if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(select_stmt->replace_relation_exprs(aggr_items, query_ref_exprs))) {
-      LOG_WARN("failed to replace aggr exprs to query ref exprs", K(ret));
-    } else if (OB_FAIL(select_stmt->get_condition_exprs().assign(select_stmt->get_having_exprs()))) {
-      LOG_WARN("failed to assign condition exprs", K(ret));
-    } else {
-      select_stmt->get_from_items().reset();
-      select_stmt->get_table_items().reset();
-      select_stmt->get_aggr_items().reset();
-      select_stmt->get_having_exprs().reset();
-      select_stmt->get_column_items().reset();
-      if (OB_FAIL(select_stmt->adjust_subquery_list())) {
-        LOG_WARN("failed to adjust subquery list", K(ret));
-      } else if (OB_FAIL(select_stmt->formalize_stmt(ctx_->session_info_))) {
-        LOG_WARN("failed to formalize stmt", K(ret));
-      } else {
-        LOG_TRACE("succeed to do transform min max", KPC(select_stmt));
       }
     }
   }
+
   return ret;
 }
 
@@ -405,6 +465,7 @@ int ObTransformMinMax::is_valid_having_expr(const ObRawExpr *expr, bool &is_vali
 int ObTransformMinMax::is_valid_order_list(const ObSelectStmt &stmt, bool &is_valid)
 {
   int ret = OB_SUCCESS;
+  return ret;
   bool valid = true;
   for (int64_t i = 0; OB_SUCC(ret) && valid && i < stmt.get_order_item_size(); ++i) {
     if (OB_FAIL(is_valid_order_expr(stmt.get_order_item(i).expr_, valid))) {
